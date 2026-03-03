@@ -191,6 +191,45 @@ class SummaryPanel(Static):
         self.query_one("#summary-content", Label).update("\n".join(lines))
 
 
+class MonthlyUsagePanel(Static):
+    """Widget showing usage breakdown by month for the current year."""
+
+    def compose(self) -> ComposeResult:
+        yield Label("[bold]Monthly Usage (this year)[/]", classes="section-title")
+        yield DataTable(id="monthly-table")
+
+    def update_data(self, monthly_breakdown: List[Dict[str, Any]]) -> None:
+        table = self.query_one("#monthly-table", DataTable)
+        table.clear(columns=True)
+        table.add_columns(
+            "Month",
+            "Requests",
+            "Events",
+            "Total Cost",
+            "Median Cost",
+            "Top Model",
+            "Max Request",
+        )
+        for row in monthly_breakdown:
+            model_breakdown = row.get("model_breakdown") or []
+            top_model = model_breakdown[0]["model"] if model_breakdown else "—"
+            top_expensive = row.get("top_expensive") or []
+            max_req = top_expensive[0] if top_expensive else {}
+            max_req_str = (
+                f"{format_money(max_req.get('cost'))} ({max_req.get('model', '?')})"
+                if max_req else "—"
+            )
+            table.add_row(
+                str(row.get("month_name", "—")),
+                str(row.get("requests", 0)),
+                str(row.get("event_count", 0)),
+                format_money(row.get("cost")),
+                format_money(row.get("median_cost")),
+                str(top_model)[:25],
+                max_req_str[:35],
+            )
+
+
 class StatusBar(Static):
     """Bottom status showing last refresh time and interval."""
 
@@ -233,6 +272,10 @@ class CursorUsageTUI(App):
 
     #summary-panel Label {
         width: 1fr;
+    }
+
+    #monthly-usage-panel {
+        margin: 0 1 1 1;
     }
 
     #tables-row {
@@ -312,8 +355,8 @@ class CursorUsageTUI(App):
         self._interval = interval
         self._refresh_timer: Optional[Any] = None
         self._refresh_in_progress = False
-        # Track whether we're currently showing the extended token columns
         self._events_has_token_cols = False
+        self._monthly_cache: Dict[int, Any] = {}
 
     # -- layout ------------------------------------------------------------
 
@@ -323,6 +366,8 @@ class CursorUsageTUI(App):
             with Vertical(id="summary-panel"):
                 yield Label("[bold]Summary[/]", classes="section-title")
                 yield SummaryPanel()
+            with Vertical(id="monthly-usage-panel", classes="table-box"):
+                yield MonthlyUsagePanel()
             with Horizontal(id="tables-row"):
                 with Vertical(id="models-box", classes="table-box"):
                     yield Label("[bold]Top Models (this month)[/]", classes="section-title")
@@ -353,6 +398,11 @@ class CursorUsageTUI(App):
         events_table = self.query_one("#events-table", DataTable)
         events_table.cursor_type = "none"
         events_table.zebra_stripes = True
+
+        # Monthly usage table
+        monthly_table = self.query_one("#monthly-table", DataTable)
+        monthly_table.cursor_type = "none"
+        monthly_table.zebra_stripes = True
 
         status = self.query_one("#status-bar", StatusBar)
         status.refresh_interval = self._interval
@@ -427,6 +477,7 @@ class CursorUsageTUI(App):
                 cookie_allowlist=self._cookie_allowlist,
                 minimal_headers=self._minimal_headers,
                 usage_user=self._usage_user,
+                monthly_cache=self._monthly_cache,
             )
             self.call_from_thread(self._apply_data, data)
         except Exception as exc:
@@ -451,6 +502,10 @@ class CursorUsageTUI(App):
         # Summary
         summary_panel = self.query_one(SummaryPanel)
         summary_panel.update_data(data)
+
+        # Monthly usage
+        monthly_panel = self.query_one(MonthlyUsagePanel)
+        monthly_panel.update_data(data.get("monthly_breakdown", []))
 
         # Models table
         models_table = self.query_one("#models-table", DataTable)
