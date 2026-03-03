@@ -872,6 +872,17 @@ def month_window_utc() -> Tuple[int, int]:
     return start_ms, end_ms
 
 
+def month_window_for(year: int, month: int) -> Tuple[int, int]:
+    """Return (start_ms, end_ms) for a given year and month in UTC."""
+    import calendar
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    _, last_day = calendar.monthrange(year, month)
+    end = datetime(year, month, last_day, 23, 59, 59, 999000, tzinfo=timezone.utc)
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+    return start_ms, end_ms
+
+
 def update_events_payload_for_month(
     data_bytes: Optional[bytes],
     page: int,
@@ -892,6 +903,58 @@ def update_events_payload_for_month(
     payload["page"] = page
     payload["pageSize"] = page_size
     return json.dumps(payload).encode("utf-8")
+
+
+def update_events_payload_for_specific_month(
+    data_bytes: Optional[bytes],
+    year: int,
+    month: int,
+    page: int,
+    page_size: int,
+) -> Optional[bytes]:
+    """Update payload with start/end dates for a specific year and month."""
+    if not data_bytes:
+        return data_bytes
+    try:
+        payload = json.loads(data_bytes.decode("utf-8"))
+    except json.JSONDecodeError:
+        return data_bytes
+    if not isinstance(payload, dict):
+        return data_bytes
+
+    start_ms, end_ms = month_window_for(year, month)
+    payload["startDate"] = str(start_ms)
+    payload["endDate"] = str(end_ms)
+    payload["page"] = page
+    payload["pageSize"] = page_size
+    return json.dumps(payload).encode("utf-8")
+
+
+def fetch_events_for_month(
+    url: str,
+    headers: Dict[str, str],
+    data_bytes: Optional[bytes],
+    year: int,
+    month: int,
+    page_size: int = 100,
+) -> List[Dict[str, Any]]:
+    """Fetch all usage events for a specific year and month."""
+    all_events: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        page_payload = update_events_payload_for_specific_month(
+            data_bytes, year, month, page, page_size
+        )
+        payload = request_json(url, headers, page_payload, method="POST")
+        events = find_events(payload)
+        all_events.extend(events)
+        if len(events) < page_size:
+            break
+        total_count = payload.get("totalUsageEventsCount")
+        if isinstance(total_count, int) and len(all_events) >= total_count:
+            break
+        page += 1
+    return all_events
 
 
 def fetch_all_events(
@@ -1007,6 +1070,129 @@ def compute_model_breakdown(events: List[Dict[str, Any]], limit: int) -> List[Di
     return ranked[:5]
 
 
+def compute_monthly_stats(events: List[Dict[str, Any]]) -> Tuple[int, float]:
+    """Compute total requests and total cost from events."""
+    total_requests = 0
+    total_cost = 0.0
+    for event in events:
+        reqs = event_request_cost(event)
+        if reqs is not None:
+            total_requests += reqs
+        cost = event_cost(event)
+        if cost is not None:
+            total_cost += cost
+    return total_requests, total_cost
+
+
+def compute_monthly_summary(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute full summary stats for a month's events.
+
+    Returns:
+        Dict with requests, total_cost, median_cost, event_count,
+        model_breakdown (top 5), top_expensive (top 5).
+    """
+    stats = compute_stats(events, len(events) or 0)
+    model_breakdown = compute_model_breakdown(events, len(events) or 0)
+    top_expensive = top_expensive_requests(events, len(events) or 0, 5)
+    return {
+        "requests": stats.get("requests", 0),
+        "total_cost": stats.get("total_cost"),
+        "median_cost": stats.get("median_cost"),
+        "event_count": stats.get("count", 0),
+        "model_breakdown": model_breakdown,
+        "top_expensive": top_expensive,
+    }
+
+
+def _build_month_entry(
+    year: int,
+    month: int,
+    summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build a month entry dict from a computed summary."""
+    import calendar as cal_mod
+    return {
+        "month": month,
+        "month_name": f"{cal_mod.month_name[month]} {year}",
+        "requests": summary.get("requests", 0),
+        "cost": summary.get("total_cost"),
+        "median_cost": summary.get("median_cost"),
+        "event_count": summary.get("event_count", 0),
+        "model_breakdown": summary.get("model_breakdown", []),
+        "top_expensive": summary.get("top_expensive", []),
+    }
+
+
+def fetch_monthly_breakdown(
+    url: str,
+    headers: Dict[str, str],
+    data_bytes: Optional[bytes],
+    year: int,
+    current_month_events: Optional[List[Dict[str, Any]]] = None,
+    cache: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch usage for each month of the given year up to the current month.
+
+    Args:
+        url: API endpoint.
+        headers: Request headers.
+        data_bytes: Request body template.
+        year: Year to fetch.
+        current_month_events: Pre-fetched events for the current month.
+            Avoids a redundant API call.
+        cache: Dict mapping month number to a previously computed entry.
+            Historical (non-current) months are served from cache.
+
+    Returns:
+        List of dicts with keys: month, month_name, requests, cost,
+        median_cost, event_count, model_breakdown, top_expensive.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if cache is None:
+        cache = {}
+
+    now = datetime.now(tz=timezone.utc)
+    current_month = now.month if year == now.year else None
+    max_month = now.month if year == now.year else 12
+
+    months_to_fetch: List[int] = []
+    for month in range(1, max_month + 1):
+        if month == current_month:
+            continue
+        if month in cache:
+            continue
+        months_to_fetch.append(month)
+
+    def _fetch_one(month: int) -> Tuple[int, Dict[str, Any]]:
+        events = fetch_events_for_month(
+            url, headers, data_bytes, year, month, page_size=100
+        )
+        summary = compute_monthly_summary(events)
+        return month, _build_month_entry(year, month, summary)
+
+    if months_to_fetch:
+        with ThreadPoolExecutor(max_workers=min(len(months_to_fetch), 4)) as pool:
+            for month, entry in pool.map(
+                _fetch_one, months_to_fetch
+            ):
+                cache[month] = entry
+
+    if current_month is not None and current_month <= max_month:
+        if current_month_events is not None:
+            summary = compute_monthly_summary(current_month_events)
+        else:
+            events = fetch_events_for_month(
+                url, headers, data_bytes, year, current_month, page_size=100
+            )
+            summary = compute_monthly_summary(events)
+        cache[current_month] = _build_month_entry(
+            year, current_month, summary
+        )
+
+    return [cache[m] for m in range(1, max_month + 1) if m in cache]
+
+
 def prepare_curl(
     curl_command: str,
     keep_all_cookies: bool = False,
@@ -1041,8 +1227,15 @@ def fetch_dashboard_data(
     cookie_allowlist: Optional[str] = None,
     minimal_headers: bool = False,
     usage_user: Optional[str] = None,
+    monthly_cache: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Fetch all data needed for the dashboard and return a structured dict."""
+    """Fetch all data needed for the dashboard and return a structured dict.
+
+    Args:
+        monthly_cache: Mutable dict that caches historical month data
+            across refreshes. Pass the same dict on every call to avoid
+            re-fetching completed months.
+    """
     url, headers, data_bytes, cookies = prepare_curl(
         curl_command,
         keep_all_cookies=keep_all_cookies,
@@ -1068,6 +1261,13 @@ def fetch_dashboard_data(
         usage_payload = request_json(usage_url, usage_headers, None, method="GET")
         billing_requests, billing_total, billing_start = extract_billing_summary(usage_payload)
 
+    now = datetime.now(tz=timezone.utc)
+    monthly_breakdown = fetch_monthly_breakdown(
+        url, headers, data_bytes, year=now.year,
+        current_month_events=events,
+        cache=monthly_cache,
+    )
+
     return {
         "events": events,
         "event_summaries": event_summaries,
@@ -1079,6 +1279,7 @@ def fetch_dashboard_data(
         "billing_requests": billing_requests,
         "billing_total": billing_total,
         "billing_start": billing_start,
+        "monthly_breakdown": monthly_breakdown,
         "limit": limit,
     }
 
